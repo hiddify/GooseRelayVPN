@@ -15,7 +15,7 @@ import (
 
 // TxBufHighWater is the soft ceiling on the per-session tx buffer; EnqueueTx
 // blocks once exceeded so a fast SOCKS5 writer can't cause unbounded growth.
-const TxBufHighWater = 2 * 1024 * 1024
+const TxBufHighWater = 8 * 1024 * 1024
 
 // Session is one logical TCP connection across the relay.
 type Session struct {

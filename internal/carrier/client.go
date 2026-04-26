@@ -18,7 +18,7 @@ import (
 const (
 	// MaxFramePayload caps the bytes per frame; larger writes are chunked.
 	// Kept small so a single Apps Script POST stays well under any limit.
-	MaxFramePayload = 32 * 1024
+	MaxFramePayload = 128 * 1024
 
 	// pollIdleSleep is the breather between polls when nothing is happening,
 	// to avoid busy-looping if the server returns instantly with empty bodies.

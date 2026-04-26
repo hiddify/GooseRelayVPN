@@ -23,11 +23,15 @@ const (
 	LongPollWindow = 8 * time.Second
 
 	// MaxFramePayload caps the bytes per downstream frame (matches carrier).
-	MaxFramePayload = 32 * 1024
+	MaxFramePayload = 128 * 1024
 
 	// upstreamReadBuf is the chunk size for reading from real net.Conn before
 	// pushing to session.EnqueueTx (which then chunks into frames).
-	upstreamReadBuf = 32 * 1024
+	upstreamReadBuf = 128 * 1024
+
+	// coalesceWindow lets us gather a few more frames before responding, which
+	// improves throughput for video streams under higher RTT links.
+	coalesceWindow = 25 * time.Millisecond
 )
 
 // Config is the DO server's configuration.
@@ -109,6 +113,24 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	for {
 		txFrames := s.drainAll()
 		if len(txFrames) > 0 {
+			// Coalesce bursts into one response to reduce per-request overhead.
+			coalesceDeadline := time.Now().Add(coalesceWindow)
+		coalesceLoop:
+			for {
+				if time.Now().After(coalesceDeadline) {
+					break coalesceLoop
+				}
+				remainingCoalesce := time.Until(coalesceDeadline)
+				select {
+				case <-r.Context().Done():
+					return
+				case <-s.activity:
+					txFrames = append(txFrames, s.drainAll()...)
+				case <-time.After(remainingCoalesce):
+					break coalesceLoop
+				}
+			}
+
 			respBody, err := frame.EncodeBatch(s.aead, txFrames)
 			if err != nil {
 				log.Printf("[exit] encode response: %v", err)
