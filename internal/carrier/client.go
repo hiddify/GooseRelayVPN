@@ -66,6 +66,44 @@ type relayEndpoint struct {
 	failCount       int
 }
 
+// numPollWorkers is the number of concurrent poll goroutines. Multiple
+// goroutines eliminate head-of-line blocking: while one goroutine is blocked
+// waiting for the server's long-poll response (e.g. CDN data for session 1),
+// the others can immediately send SYNs for sessions 2, 3, 4 that queued up.
+const numPollWorkers = 3
+
+// maxConcurrentIdlePolls limits how many workers may issue an empty poll
+// simultaneously. Empty polls are long-held by the server (LongPollWindow), so
+// if all workers enter them at once, newly queued SYN/data frames must wait
+// for a worker to return, causing 8s/16s latency spikes. Keep one long-poll
+// for downstream push, and leave the rest of workers available for outbound TX.
+const maxConcurrentIdlePolls = 1
+
+// waker is a broadcast notifier: Broadcast() wakes all goroutines currently
+// blocked on C() simultaneously, unlike a buffered chan which only wakes one.
+type waker struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newWaker() *waker { return &waker{ch: make(chan struct{})} }
+
+// C returns the current channel to select on. Must be captured before
+// entering select so a concurrent Broadcast() cannot be missed.
+func (w *waker) C() <-chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ch
+}
+
+// Broadcast unblocks all goroutines currently waiting on C().
+func (w *waker) Broadcast() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	close(w.ch)
+	w.ch = make(chan struct{})
+}
+
 // Client owns the session map and the long-poll loop.
 type Client struct {
 	cfg  Config
@@ -74,12 +112,16 @@ type Client struct {
 
 	mu       sync.Mutex
 	sessions map[[frame.SessionIDLen]byte]*session.Session
+	inFlight map[[frame.SessionIDLen]byte]bool
 
 	endpointMu   sync.Mutex
 	endpoints    []relayEndpoint
 	nextEndpoint int
 
-	kickCh chan struct{} // buffered len 1; coalesces OnTx wake-ups
+	idlePollMu       sync.Mutex
+	idlePollInFlight int
+
+	wake *waker // broadcasts to all idle poll goroutines simultaneously
 }
 
 // New constructs a Client. The HTTP client is preconfigured for domain
@@ -112,8 +154,9 @@ func New(cfg Config) (*Client, error) {
 		aead:      aead,
 		http:      NewFrontedClient(cfg.Fronting, pollTimeout),
 		sessions:  make(map[[frame.SessionIDLen]byte]*session.Session),
+		inFlight:  make(map[[frame.SessionIDLen]byte]bool),
 		endpoints: endpoints,
-		kickCh:    make(chan struct{}, 1),
+		wake:      newWaker(),
 	}, nil
 }
 
@@ -136,22 +179,42 @@ func (c *Client) NewSession(target string) *session.Session {
 	return s
 }
 
-// Run drives the poll loop until ctx is canceled.
+// Run spawns numPollWorkers concurrent poll goroutines and blocks until ctx
+// is canceled. Parallel workers eliminate head-of-line blocking: while one
+// worker waits for a server long-poll response, the others immediately dispatch
+// queued SYNs for new sessions opened at the same time (e.g. YouTube page load).
 func (c *Client) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	for i := 0; i < numPollWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.runWorker(ctx)
+		}()
+	}
+	wg.Wait()
+	return ctx.Err()
+}
+
+func (c *Client) runWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		default:
 		}
 		didWork := c.pollOnce(ctx)
 		c.gcDoneSessions()
 		if !didWork {
+			// Capture the wake channel before entering select so we cannot
+			// miss a Broadcast() that fires between drainAll() returning
+			// empty and us entering the wait.
+			wakeCh := c.wake.C()
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			case <-c.kickCh:
-				// woken by EnqueueTx
+				return
+			case <-wakeCh:
+				// woken by new session data
 			case <-time.After(pollIdleSleep):
 			}
 		}
@@ -162,7 +225,17 @@ func (c *Client) Run(ctx context.Context) error {
 // response frames back to their sessions. Returns true if any work was done
 // (frames sent or received) so the Run loop can decide whether to sleep.
 func (c *Client) pollOnce(ctx context.Context) bool {
-	frames := c.drainAll()
+	frames, drainedIDs := c.drainAll()
+	if len(drainedIDs) > 0 {
+		defer c.releaseInFlight(drainedIDs)
+	}
+	isIdlePoll := len(frames) == 0
+	if isIdlePoll {
+		if !c.acquireIdlePollSlot() {
+			return false
+		}
+		defer c.releaseIdlePollSlot()
+	}
 
 	body, err := frame.EncodeBatch(c.aead, frames)
 	if err != nil {
@@ -331,28 +404,45 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 	ep.blacklistedTill = time.Now().Add(ttl)
 }
 
-func (c *Client) drainAll() []*frame.Frame {
+func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var out []*frame.Frame
+	var drainedIDs [][frame.SessionIDLen]byte
 	batchCap := maxDrainFramesPerBatch
 	if len(c.sessions) >= busySessionThreshold {
 		batchCap = maxDrainFramesPerBatchBusy
 	}
 	remaining := batchCap
-	for _, s := range c.sessions {
+	for id, s := range c.sessions {
 		if remaining <= 0 {
 			break
+		}
+		if c.inFlight[id] {
+			continue
 		}
 		perSessionCap := maxDrainFramesPerSession
 		if remaining < perSessionCap {
 			perSessionCap = remaining
 		}
 		frames := s.DrainTxLimited(MaxFramePayload, perSessionCap)
+		if len(frames) == 0 {
+			continue
+		}
+		c.inFlight[id] = true
+		drainedIDs = append(drainedIDs, id)
 		out = append(out, frames...)
 		remaining -= len(frames)
 	}
-	return out
+	return out, drainedIDs
+}
+
+func (c *Client) releaseInFlight(ids [][frame.SessionIDLen]byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range ids {
+		delete(c.inFlight, id)
+	}
 }
 
 func (c *Client) routeRx(f *frame.Frame) {
@@ -361,6 +451,17 @@ func (c *Client) routeRx(f *frame.Frame) {
 	c.mu.Unlock()
 	if !ok {
 		return // unknown session - drop
+	}
+	if f.HasFlag(frame.FlagRST) {
+		// Server has no state for this session (e.g. it restarted). Tear it down
+		// immediately so the SOCKS client gets an error and reconnects cleanly.
+		log.Printf("[carrier] RST from server for session %x; closing", f.SessionID[:4])
+		s.CloseRx()
+		s.RequestClose()
+		c.mu.Lock()
+		delete(c.sessions, f.SessionID)
+		c.mu.Unlock()
+		return
 	}
 	s.ProcessRx(f)
 }
@@ -375,12 +476,27 @@ func (c *Client) gcDoneSessions() {
 	}
 }
 
-// kick wakes the poll loop. Safe to call from any goroutine; coalesces.
-func (c *Client) kick() {
-	select {
-	case c.kickCh <- struct{}{}:
-	default:
+func (c *Client) acquireIdlePollSlot() bool {
+	c.idlePollMu.Lock()
+	defer c.idlePollMu.Unlock()
+	if c.idlePollInFlight >= maxConcurrentIdlePolls {
+		return false
 	}
+	c.idlePollInFlight++
+	return true
+}
+
+func (c *Client) releaseIdlePollSlot() {
+	c.idlePollMu.Lock()
+	defer c.idlePollMu.Unlock()
+	if c.idlePollInFlight > 0 {
+		c.idlePollInFlight--
+	}
+}
+
+// kick broadcasts to all idle poll workers. Safe to call from any goroutine.
+func (c *Client) kick() {
+	c.wake.Broadcast()
 }
 
 func isLikelyNonBatchRelayPayload(body []byte) bool {

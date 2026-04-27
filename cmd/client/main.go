@@ -86,7 +86,10 @@ func shortScriptKey(scriptURL string) string {
 			return id
 		}
 	}
-	return "(unknown)"
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return scriptURL
 }
 
 func summarizeScriptURLs(scriptURLs []string) string {
@@ -120,8 +123,13 @@ func main() {
 	log.Printf("[client] GooseRelayVPN client starting")
 	log.Printf("[client] config loaded from %s", *configPath)
 	log.Printf("[client] SOCKS5 proxy: socks5://%s", cfg.ListenAddr)
-	log.Printf("[client] fronting via %s (sni=%s)", cfg.GoogleIP, cfg.SNIHost)
-	log.Printf("[client] script_keys: %d (%s)", len(cfg.ScriptURLs), summarizeScriptURLs(cfg.ScriptURLs))
+	if cfg.UseFronting {
+		log.Printf("[client] mode: fronting")
+		log.Printf("[client] fronting via %s (sni=%s)", cfg.GoogleIP, cfg.SNIHost)
+	} else {
+		log.Printf("[client] mode: direct relay_urls (fronting disabled)")
+	}
+	log.Printf("[client] relay endpoints: %d (%s)", len(cfg.ScriptURLs), summarizeScriptURLs(cfg.ScriptURLs))
 
 	carr, err := carrier.New(carrier.Config{
 		ScriptURLs: cfg.ScriptURLs,

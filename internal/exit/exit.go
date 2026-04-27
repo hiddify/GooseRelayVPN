@@ -21,9 +21,13 @@ import (
 const (
 	// ActiveDrainWindow caps how long a batch that just performed real work
 	// (SYN/connect or non-empty uplink data) waits for downstream bytes.
-	// This limits head-of-line blocking when one slow target would otherwise
-	// hold the whole carrier loop for the full long-poll window.
-	ActiveDrainWindow = 2 * time.Second
+	// Kept short so the client's single poll loop can quickly cycle back
+	// and send SYN frames for other sessions that queued up while this poll
+	// was in-flight. A long value here (e.g. 2s) causes head-of-line
+	// blocking: when YouTube opens 4-6 parallel connections, later SYNs
+	// are delayed by ActiveDrainWindow × (position in queue), easily
+	// pushing total setup time past the player's ~7s abort threshold.
+	ActiveDrainWindow = 350 * time.Millisecond
 
 	// LongPollWindow is how long the handler holds open a request waiting for
 	// downstream bytes. UrlFetchApp has a practical read timeout of ~10s, so
@@ -71,9 +75,10 @@ type Server struct {
 	aead *frame.Crypto
 	dial func(network, address string, timeout time.Duration) (net.Conn, error)
 
-	mu       sync.Mutex
-	sessions map[[frame.SessionIDLen]byte]*session.Session
-	dialFail map[string]time.Time
+	mu          sync.Mutex
+	sessions    map[[frame.SessionIDLen]byte]*session.Session
+	dialFail    map[string]time.Time
+	pendingRSTs []*frame.Frame // RST frames to send back on the next response
 
 	activity chan struct{} // buffered len 1; coalesces "session has new tx" signals
 }
@@ -209,7 +214,12 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 
 	if !exists {
 		if !f.HasFlag(frame.FlagSYN) {
-			log.Printf("[exit] frame for unknown session (no SYN), dropping")
+			log.Printf("[exit] frame for unknown session (no SYN), sending RST")
+			rst := &frame.Frame{SessionID: f.SessionID, Flags: frame.FlagRST}
+			s.mu.Lock()
+			s.pendingRSTs = append(s.pendingRSTs, rst)
+			s.mu.Unlock()
+			s.kick()
 			return
 		}
 		if s.isDialSuppressed(f.Target) {
@@ -281,6 +291,10 @@ func (s *Server) drainAll() []*frame.Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*frame.Frame
+	if len(s.pendingRSTs) > 0 {
+		out = append(out, s.pendingRSTs...)
+		s.pendingRSTs = s.pendingRSTs[:0]
+	}
 	batchCap := maxDrainFramesPerBatch
 	if len(s.sessions) >= busySessionThreshold {
 		batchCap = maxDrainFramesPerBatchBusy
