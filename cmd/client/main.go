@@ -125,7 +125,11 @@ func main() {
 	log.Printf("[client] SOCKS5 proxy: socks5://%s", cfg.ListenAddr)
 	if cfg.UseFronting {
 		log.Printf("[client] mode: fronting")
-		log.Printf("[client] fronting via %s (sni=%s)", cfg.GoogleIP, cfg.SNIHost)
+		if len(cfg.SNIHosts) == 1 {
+			log.Printf("[client] fronting via %s (sni=%s)", cfg.GoogleIP, cfg.SNIHosts[0])
+		} else {
+			log.Printf("[client] fronting via %s (sni hosts: %s — %d throttle buckets)", cfg.GoogleIP, strings.Join(cfg.SNIHosts, ", "), len(cfg.SNIHosts))
+		}
 	} else {
 		log.Printf("[client] mode: direct relay_urls (fronting disabled)")
 	}
@@ -136,7 +140,7 @@ func main() {
 		AESKeyHex:  cfg.AESKeyHex,
 		Fronting: carrier.FrontingConfig{
 			GoogleIP: cfg.GoogleIP,
-			SNIHost:  cfg.SNIHost,
+			SNIHosts: cfg.SNIHosts,
 		},
 	})
 	if err != nil {

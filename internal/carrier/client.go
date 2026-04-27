@@ -116,9 +116,10 @@ func (w *waker) Broadcast() {
 
 // Client owns the session map and the long-poll loop.
 type Client struct {
-	cfg  Config
-	aead *frame.Crypto
-	http *http.Client
+	cfg         Config
+	aead        *frame.Crypto
+	httpClients []*http.Client  // one per SNI host; round-robined per request
+	nextHTTP    atomic.Uint64   // round-robin index into httpClients
 
 	mu       sync.Mutex
 	sessions map[[frame.SessionIDLen]byte]*session.Session
@@ -176,14 +177,14 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		cfg:       cfg,
-		aead:      aead,
-		http:      NewFrontedClient(cfg.Fronting, pollTimeout),
-		sessions:  make(map[[frame.SessionIDLen]byte]*session.Session),
-		inFlight:  make(map[[frame.SessionIDLen]byte]bool),
-		txReady:   make(map[[frame.SessionIDLen]byte]struct{}),
-		endpoints: endpoints,
-		wake:      newWaker(),
+		cfg:         cfg,
+		aead:        aead,
+		httpClients: NewFrontedClients(cfg.Fronting, pollTimeout),
+		sessions:    make(map[[frame.SessionIDLen]byte]*session.Session),
+		inFlight:    make(map[[frame.SessionIDLen]byte]bool),
+		txReady:     make(map[[frame.SessionIDLen]byte]struct{}),
+		endpoints:   endpoints,
+		wake:        newWaker(),
 	}, nil
 }
 
@@ -330,7 +331,7 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		req.Header.Set("Content-Type", "text/plain")
 		attempted = true
 
-		resp, err := c.http.Do(req)
+		resp, err := c.pickHTTPClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return false
@@ -427,6 +428,17 @@ func countFrameBytes(frameCounter, byteCounter *atomic.Uint64, frames []*frame.F
 	}
 	frameCounter.Add(uint64(len(frames)))
 	byteCounter.Add(bytes)
+}
+
+// pickHTTPClient returns the next HTTP client in round-robin order. Each
+// client has a distinct SNI host and connection pool, so successive calls
+// naturally spread requests across separate throttle buckets.
+func (c *Client) pickHTTPClient() *http.Client {
+	if len(c.httpClients) == 1 {
+		return c.httpClients[0]
+	}
+	idx := c.nextHTTP.Add(1) - 1
+	return c.httpClients[idx%uint64(len(c.httpClients))]
 }
 
 func (c *Client) pickRelayEndpoint() (int, string) {

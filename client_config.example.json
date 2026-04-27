@@ -2,7 +2,7 @@
   "socks_host": "127.0.0.1",
   "socks_port": 1080,
   "google_host": "216.239.38.120",
-  "sni": "www.google.com",
+  "sni": ["www.google.com", "mail.google.com", "accounts.google.com"],
   "script_keys": [
     "REPLACE_WITH_DEPLOYMENT_ID",
     "OPTIONAL_SECOND_DEPLOYMENT_ID"

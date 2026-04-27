@@ -19,7 +19,7 @@ import (
 type Client struct {
 	ListenAddr  string
 	GoogleIP    string   // "ip:port"; empty when direct relay_urls mode is used
-	SNIHost     string   // e.g. "www.google.com"; empty when direct relay_urls mode is used
+	SNIHosts    []string // one or more TLS SNI names; empty when direct relay_urls mode is used
 	ScriptURLs  []string // one or more relay endpoints (Apps Script URLs or direct relay_urls)
 	UseFronting bool
 	AESKeyHex   string // 64-char hex
@@ -34,8 +34,12 @@ type clientFile struct {
 	// Google front endpoint.
 	GoogleHost string `json:"google_host"`
 
-	// TLS SNI.
-	SNI string `json:"sni"`
+	// TLS SNI: accepts a single string ("www.google.com") or an array of
+	// strings (["www.google.com", "mail.google.com", "accounts.google.com"]).
+	// Multiple SNI hosts are round-robined per request, each hitting a separate
+	// throttle bucket on the Google CDN — useful in regions that rate-limit
+	// per domain name.
+	SNI json.RawMessage `json:"sni"`
 
 	// Apps Script Deployment IDs (one or more).
 	ScriptKeys []string `json:"script_keys"`
@@ -154,6 +158,41 @@ func validateDeploymentID(id string) error {
 	return nil
 }
 
+// parseSNIHosts parses the "sni" JSON field, which may be either a single
+// string ("www.google.com") or an array (["www.google.com", "mail.google.com"]).
+// Falls back to ["www.google.com"] when the field is absent or empty.
+func parseSNIHosts(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return []string{"www.google.com"}
+	}
+	// Try string first (backward-compatible single-SNI config).
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		single = strings.TrimSpace(single)
+		if single == "" {
+			return []string{"www.google.com"}
+		}
+		return []string{single}
+	}
+	// Try array.
+	var multi []string
+	if err := json.Unmarshal(raw, &multi); err != nil {
+		// Malformed — fall back to default and let the rest of validation catch it.
+		return []string{"www.google.com"}
+	}
+	out := make([]string, 0, len(multi))
+	for _, h := range multi {
+		h = strings.TrimSpace(h)
+		if h != "" {
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"www.google.com"}
+	}
+	return out
+}
+
 // LoadClient reads and validates a client config file.
 func LoadClient(path string) (*Client, error) {
 	b, err := os.ReadFile(path)
@@ -205,13 +244,13 @@ func LoadClient(path string) (*Client, error) {
 	useFronting := len(relayURLs) == 0
 	scriptURLs := relayURLs
 	googleIP := ""
-	sniHost := ""
+	var sniHosts []string
 
 	if useFronting {
 		googleHost := firstNonEmpty(f.GoogleHost, "216.239.38.120")
 		googlePort := 443
 		googleIP = net.JoinHostPort(googleHost, strconv.Itoa(googlePort))
-		sniHost = firstNonEmpty(f.SNI, "www.google.com")
+		sniHosts = parseSNIHosts(f.SNI)
 
 		if len(f.ScriptKeys) == 0 {
 			return nil, fmt.Errorf("script_keys is empty in %s.\n  Fix: deploy apps_script/Code.gs as a Web App with Access: Anyone, then paste the Deployment ID into the script_keys array. See README Step 5", path)
@@ -236,7 +275,7 @@ func LoadClient(path string) (*Client, error) {
 	c := Client{
 		ListenAddr:  net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
 		GoogleIP:    googleIP,
-		SNIHost:     sniHost,
+		SNIHosts:    sniHosts,
 		ScriptURLs:  scriptURLs,
 		UseFronting: useFronting,
 		AESKeyHex:   key,

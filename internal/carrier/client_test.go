@@ -139,7 +139,7 @@ func TestCarrier_PollOnceDropsNonBatchPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	c.http = srv.Client()
+	c.httpClients = []*http.Client{srv.Client()}
 
 	if didWork := c.pollOnce(context.Background()); didWork {
 		t.Fatal("expected no work for non-batch relay payload")

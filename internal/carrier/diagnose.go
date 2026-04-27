@@ -35,7 +35,7 @@ func (c *Client) Diagnose(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("building GET request: %w", err)
 	}
-	getResp, err := c.http.Do(getReq)
+	getResp, err := c.pickHTTPClient().Do(getReq)
 	if err != nil {
 		return fmt.Errorf("cannot reach Apps Script (network or fronting issue): %v\n  Hints: confirm the machine has internet access; try a different google_host (any 216.239.x.120 served by Google works)", err)
 	}
@@ -62,7 +62,7 @@ func (c *Client) Diagnose(ctx context.Context) error {
 		return fmt.Errorf("building POST request: %w", err)
 	}
 	postReq.Header.Set("Content-Type", "text/plain")
-	postResp, err := c.http.Do(postReq)
+	postResp, err := c.pickHTTPClient().Do(postReq)
 	if err != nil {
 		return fmt.Errorf("probe POST failed: %w", err)
 	}
