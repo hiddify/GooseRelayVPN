@@ -72,6 +72,19 @@ const (
 	// dialFailureBackoff is how long we suppress repeated SYN dial attempts to a
 	// target after a structural network/DNS failure.
 	dialFailureBackoff = 2 * time.Second
+
+	// idleSessionTimeout caps how long a session can go without any client-side
+	// frame before we declare it orphaned and force-close the upstream.
+	// Triggered by ungraceful client disconnects (Ctrl+C, OOM kill, sleep/wake,
+	// network drop): without this the upstream goroutines and TCP connections
+	// stay alive indefinitely for any persistent target (Telegram, websockets,
+	// etc.), and the server slowly grinds to a halt over multiple disconnect
+	// cycles. 10 minutes is long enough to tolerate quiet streaming sessions
+	// (large download with no client→server traffic) without false-positives.
+	idleSessionTimeout = 10 * time.Minute
+
+	// idleGCInterval is how often the cleanup loop scans for orphaned sessions.
+	idleGCInterval = 60 * time.Second
 )
 
 // Config is the VPS server's configuration.
@@ -89,12 +102,14 @@ type Server struct {
 	dns          *dnsCache
 	debugTiming  bool
 
-	mu          sync.Mutex
-	sessions    map[[frame.SessionIDLen]byte]*session.Session
-	txReady     map[[frame.SessionIDLen]byte]struct{} // sessions with pending TX frames
-	firstReply  map[[frame.SessionIDLen]byte]struct{} // sessions whose first downstream batch hasn't been sent yet
-	dialFail    map[string]time.Time
-	pendingRSTs []*frame.Frame // RST frames to send back on the next response
+	mu           sync.Mutex
+	sessions     map[[frame.SessionIDLen]byte]*session.Session
+	txReady      map[[frame.SessionIDLen]byte]struct{} // sessions with pending TX frames
+	firstReply   map[[frame.SessionIDLen]byte]struct{} // sessions whose first downstream batch hasn't been sent yet
+	upstreams    map[[frame.SessionIDLen]byte]net.Conn // upstream conn per session, kept so GC can force-close
+	lastActivity map[[frame.SessionIDLen]byte]time.Time // last time the client sent a frame for this session
+	dialFail     map[string]time.Time
+	pendingRSTs  []*frame.Frame // RST frames to send back on the next response
 
 	activity chan struct{} // buffered len 1; coalesces "session has new tx" signals
 	stats    serverStats
@@ -122,16 +137,18 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:         cfg,
-		aead:        aead,
-		dial:        net.DialTimeout,
-		dns:         newDNSCache(),
-		debugTiming: cfg.DebugTiming,
-		sessions:    make(map[[frame.SessionIDLen]byte]*session.Session),
-		txReady:     make(map[[frame.SessionIDLen]byte]struct{}),
-		firstReply:  make(map[[frame.SessionIDLen]byte]struct{}),
-		dialFail:    make(map[string]time.Time),
-		activity:    make(chan struct{}, 1),
+		cfg:          cfg,
+		aead:         aead,
+		dial:         net.DialTimeout,
+		dns:          newDNSCache(),
+		debugTiming:  cfg.DebugTiming,
+		sessions:     make(map[[frame.SessionIDLen]byte]*session.Session),
+		txReady:      make(map[[frame.SessionIDLen]byte]struct{}),
+		firstReply:   make(map[[frame.SessionIDLen]byte]struct{}),
+		upstreams:    make(map[[frame.SessionIDLen]byte]net.Conn),
+		lastActivity: make(map[[frame.SessionIDLen]byte]time.Time),
+		dialFail:     make(map[string]time.Time),
+		activity:     make(chan struct{}, 1),
 	}, nil
 }
 
@@ -152,12 +169,11 @@ func (s *Server) ListenAndServe() error {
 		WriteTimeout: LongPollWindow + 10*time.Second,
 	}
 
-	// Periodic stats line so an operator following journalctl/systemd logs can
-	// see traffic + session health without grepping. Lives for the lifetime of
-	// the HTTP server (cancelled when ListenAndServe returns).
-	statsCtx, cancelStats := context.WithCancel(context.Background())
-	defer cancelStats()
-	go s.runStatsLoop(statsCtx)
+	// Background loops that share the lifetime of the HTTP server.
+	bgCtx, cancelBg := context.WithCancel(context.Background())
+	defer cancelBg()
+	go s.runStatsLoop(bgCtx)
+	go s.runIdleGCLoop(bgCtx)
 
 	log.Printf("[exit] listening on %s", s.cfg.ListenAddr)
 	return httpSrv.ListenAndServe()
@@ -315,6 +331,13 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 		s.clearDialFailure(f.Target)
 	}
 	sess.ProcessRx(f)
+	// Touch activity AFTER ProcessRx so a successful client→server frame
+	// resets the idle timer for this session.
+	s.mu.Lock()
+	if _, stillExists := s.sessions[f.SessionID]; stillExists {
+		s.lastActivity[f.SessionID] = time.Now()
+	}
+	s.mu.Unlock()
 }
 
 // openSession dials the upstream target, creates a Session for the given ID,
@@ -347,7 +370,9 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 
 	s.mu.Lock()
 	s.sessions[id] = sess
+	s.upstreams[id] = upstream
 	s.firstReply[id] = struct{}{}
+	s.lastActivity[id] = time.Now()
 	s.mu.Unlock()
 	s.stats.sessionsOpen.Add(1)
 
@@ -451,7 +476,84 @@ func (s *Server) gcDoneSessions() {
 			delete(s.sessions, id)
 			delete(s.txReady, id)
 			delete(s.firstReply, id)
+			delete(s.upstreams, id)
+			delete(s.lastActivity, id)
 			s.stats.sessionsClose.Add(1)
+		}
+	}
+}
+
+// gcIdleSessions force-closes sessions that haven't seen any client-side
+// activity (incoming frame) for longer than idleSessionTimeout. This is the
+// safety net for ungraceful client disconnects: when the client is killed
+// without sending FIN/RST per session, the upstream goroutines and TCP
+// connections to long-lived targets (Telegram, websockets, etc.) would
+// otherwise leak forever.
+func (s *Server) gcIdleSessions() {
+	threshold := time.Now().Add(-idleSessionTimeout)
+
+	type victim struct {
+		id       [frame.SessionIDLen]byte
+		sess     *session.Session
+		upstream net.Conn
+		target   string
+		idleFor  time.Duration
+	}
+	var victims []victim
+
+	s.mu.Lock()
+	for id, last := range s.lastActivity {
+		if last.After(threshold) {
+			continue
+		}
+		sess, ok := s.sessions[id]
+		if !ok {
+			delete(s.lastActivity, id)
+			continue
+		}
+		victims = append(victims, victim{
+			id:       id,
+			sess:     sess,
+			upstream: s.upstreams[id],
+			target:   sess.Target,
+			idleFor:  time.Since(last),
+		})
+		delete(s.sessions, id)
+		delete(s.txReady, id)
+		delete(s.firstReply, id)
+		delete(s.upstreams, id)
+		delete(s.lastActivity, id)
+	}
+	s.mu.Unlock()
+
+	for _, v := range victims {
+		log.Printf("[exit] GC orphaned session %x (target=%s, idle for %s)",
+			v.id[:4], v.target, v.idleFor.Round(time.Second))
+		// Closing upstream causes the read goroutine in openSession to error
+		// and exit, which triggers the write goroutine to exit too via the
+		// session.RxChan close path. CloseRx + Stop are both idempotent.
+		if v.upstream != nil {
+			_ = v.upstream.Close()
+		}
+		if v.sess != nil {
+			v.sess.CloseRx()
+			v.sess.Stop()
+		}
+		s.stats.sessionsClose.Add(1)
+	}
+}
+
+// runIdleGCLoop periodically scans for orphaned sessions and force-closes
+// them. Returns when ctx is canceled.
+func (s *Server) runIdleGCLoop(ctx context.Context) {
+	t := time.NewTicker(idleGCInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.gcIdleSessions()
 		}
 	}
 }
