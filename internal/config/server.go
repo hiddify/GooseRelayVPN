@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,9 +15,10 @@ import (
 
 // Server is the VPS exit server config.
 type Server struct {
-	ListenAddr  string
-	AESKeyHex   string
-	DebugTiming bool
+	ListenAddr    string
+	AESKeyHex     string
+	DebugTiming   bool
+	UpstreamProxy string // optional socks5://host:port; when set, all outbound dials go through this proxy
 }
 
 type serverFile struct {
@@ -28,6 +30,11 @@ type serverFile struct {
 	// Optional: when true, log per-session dial breakdown (DNS, TCP, first
 	// upstream read) so an operator can pinpoint where latency is going.
 	DebugTiming bool `json:"debug_timing"`
+
+	// Optional: route all outbound connections through a local SOCKS5 proxy
+	// (e.g. Cloudflare WARP on socks5://127.0.0.1:40000). Useful when the VPS
+	// datacenter IP is blocked by certain sites.
+	UpstreamProxy string `json:"upstream_proxy"`
 
 	// Legacy keys kept as fallback for existing deployments.
 	ListenAddr string `json:"listen_addr"`
@@ -86,10 +93,23 @@ func LoadServer(path string) (*Server, error) {
 		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Copy the value from client_config.json carefully — no spaces, quotes, or extra newlines", path)
 	}
 
+	var upstreamProxy string
+	if raw := strings.TrimSpace(f.UpstreamProxy); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "socks5" {
+			return nil, fmt.Errorf("upstream_proxy must be a socks5:// URL (e.g. socks5://127.0.0.1:40000), got %q", raw)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("upstream_proxy is missing host:port (e.g. socks5://127.0.0.1:40000)")
+		}
+		upstreamProxy = u.Host
+	}
+
 	c := Server{
-		ListenAddr:  net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		AESKeyHex:   key,
-		DebugTiming: f.DebugTiming,
+		ListenAddr:    net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		AESKeyHex:     key,
+		DebugTiming:   f.DebugTiming,
+		UpstreamProxy: upstreamProxy,
 	}
 	return &c, nil
 }

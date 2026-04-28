@@ -18,6 +18,7 @@ import (
 
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
 	"github.com/kianmhz/GooseRelayVPN/internal/session"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -89,9 +90,10 @@ const (
 
 // Config is the VPS server's configuration.
 type Config struct {
-	ListenAddr   string // "0.0.0.0:8443"
-	AESKeyHex    string // 64-char hex
-	DebugTiming  bool   // when true, log per-session dial breakdown and first-read latency
+	ListenAddr    string // "0.0.0.0:8443"
+	AESKeyHex     string // 64-char hex
+	DebugTiming   bool   // when true, log per-session dial breakdown and first-read latency
+	UpstreamProxy string // optional "host:port" of a local SOCKS5 proxy (e.g. WARP on 127.0.0.1:40000)
 }
 
 // Server holds the per-process session state.
@@ -136,10 +138,11 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	dialFn := dialFunc(cfg.UpstreamProxy)
 	return &Server{
 		cfg:          cfg,
 		aead:         aead,
-		dial:         net.DialTimeout,
+		dial:         dialFn,
 		dns:          newDNSCache(),
 		debugTiming:  cfg.DebugTiming,
 		sessions:     make(map[[frame.SessionIDLen]byte]*session.Session),
@@ -150,6 +153,33 @@ func New(cfg Config) (*Server, error) {
 		dialFail:     make(map[string]time.Time),
 		activity:     make(chan struct{}, 1),
 	}, nil
+}
+
+// dialFunc returns a dial function. When proxyAddr is non-empty it routes all
+// outbound connections through the SOCKS5 proxy at that address; otherwise it
+// falls back to net.DialTimeout.
+func dialFunc(proxyAddr string) func(network, address string, timeout time.Duration) (net.Conn, error) {
+	if proxyAddr == "" {
+		return net.DialTimeout
+	}
+	forward := &net.Dialer{Timeout: 15 * time.Second}
+	d, err := proxy.SOCKS5("tcp", proxyAddr, nil, forward)
+	if err != nil {
+		// proxy.SOCKS5 only errors on bad auth config; with nil auth this never fires.
+		log.Printf("[exit] upstream_proxy: failed to build SOCKS5 dialer: %v — falling back to direct", err)
+		return net.DialTimeout
+	}
+	cd, ok := d.(proxy.ContextDialer)
+	if !ok {
+		return func(_, address string, _ time.Duration) (net.Conn, error) {
+			return d.Dial("tcp", address)
+		}
+	}
+	return func(_, address string, timeout time.Duration) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return cd.DialContext(ctx, "tcp", address)
+	}
 }
 
 // ListenAndServe blocks. It binds an HTTP listener on cfg.ListenAddr with one
@@ -343,11 +373,24 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 // openSession dials the upstream target, creates a Session for the given ID,
 // registers it, and spawns the bidirectional pump goroutines.
 func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*session.Session, error) {
-	res, err := dialWithDNSCache(s.dns, s.dial, "tcp", target, 15*time.Second)
-	if err != nil {
-		return nil, err
+	var upstream net.Conn
+	var res *dialResult
+	if s.cfg.UpstreamProxy != "" {
+		// Let the SOCKS5 proxy handle DNS so the target hostname is resolved
+		// on the proxy side (e.g. through WARP), not locally on the VPS.
+		conn, err := s.dial("tcp", target, 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		upstream = conn
+	} else {
+		var err error
+		res, err = dialWithDNSCache(s.dns, s.dial, "tcp", target, 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		upstream = res.Conn
 	}
-	upstream := res.Conn
 	// Disable Nagle's algorithm so small writes (TLS handshake records, HTTP
 	// request lines) hit the wire immediately instead of waiting up to 40 ms
 	// to coalesce. Interactive workloads dominate this tunnel; throughput-bound
@@ -356,8 +399,12 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 		_ = tcpConn.SetNoDelay(true)
 	}
 	if s.debugTiming {
-		log.Printf("[timing] %x dial dns=%dms cached=%v tcp=%dms target=%s",
-			id[:4], res.DNS.Milliseconds(), res.DNSCached, res.TCP.Milliseconds(), target)
+		if res != nil {
+			log.Printf("[timing] %x dial dns=%dms cached=%v tcp=%dms target=%s",
+				id[:4], res.DNS.Milliseconds(), res.DNSCached, res.TCP.Milliseconds(), target)
+		} else {
+			log.Printf("[timing] %x dial via proxy target=%s", id[:4], target)
+		}
 	}
 	dialedAt := time.Now()
 	sess := session.New(id, target, false)

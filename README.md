@@ -305,6 +305,8 @@ What the client does for you automatically:
 | `server_host` | `0.0.0.0` | Host/IP where the exit server binds. |
 | `server_port` | `8443` | Port where the exit server listens. Must be reachable from Google's network. |
 | `tunnel_key` | — | 64-char hex AES-256 key. Must match the client. |
+| `upstream_proxy` | *(optional)* | Route all outbound connections through a local SOCKS5 proxy. Useful when your VPS datacenter IP is blocked by certain sites. Set to `socks5://127.0.0.1:40000` to use Cloudflare WARP (DNS is resolved by the proxy, so target sites see the Cloudflare IP instead of your VPS IP). Leave empty or omit to dial directly. |
+| `debug_timing` | `false` | When `true`, logs per-session DNS and TCP dial latency so you can pinpoint where time is going. |
 
 ---
 

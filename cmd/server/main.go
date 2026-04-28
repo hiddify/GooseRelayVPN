@@ -22,9 +22,10 @@ func main() {
 	}
 
 	srv, err := exit.New(exit.Config{
-		ListenAddr:  cfg.ListenAddr,
-		AESKeyHex:   cfg.AESKeyHex,
-		DebugTiming: cfg.DebugTiming,
+		ListenAddr:    cfg.ListenAddr,
+		AESKeyHex:     cfg.AESKeyHex,
+		DebugTiming:   cfg.DebugTiming,
+		UpstreamProxy: cfg.UpstreamProxy,
 	})
 	if err != nil {
 		log.Fatalf("exit: %v", err)
@@ -38,6 +39,9 @@ func main() {
 	log.Printf("[exit] tunnel : POST http://YOUR.VPS.IP:%s/tunnel    (this is the VPS_URL in Code.gs)", port)
 	if cfg.DebugTiming {
 		log.Printf("[exit] debug_timing enabled — per-session dial breakdown will be logged")
+	}
+	if cfg.UpstreamProxy != "" {
+		log.Printf("[exit] upstream_proxy enabled — outbound connections routed via SOCKS5 %s", cfg.UpstreamProxy)
 	}
 
 	if err := srv.ListenAndServe(); err != nil {
