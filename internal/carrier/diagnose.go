@@ -3,6 +3,7 @@ package carrier
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,8 +53,20 @@ func (c *Client) Diagnose(ctx context.Context) error {
 		return fmt.Errorf("unexpected response from Apps Script %s (HTTP %d): %s", shortScriptKey(scriptURL), getResp.StatusCode, snippet(getBody))
 	}
 
-	// --- Probe 2: POST an empty encrypted batch to verify VPS reachability and AES key. ---
-	body, err := frame.EncodeBatch(c.aead, nil)
+	// --- Probe 2: POST an encrypted probe frame to verify VPS reachability and AES key. ---
+	// We send a non-SYN frame for a random session ID. The server has no state
+	// for that ID and immediately queues an RST in response, which we receive
+	// in the same HTTP body. This avoids the server's 8s long-poll wait that
+	// an empty batch would trigger, cutting pre-flight latency from ~10s to <1s.
+	var probeID [frame.SessionIDLen]byte
+	if _, rerr := rand.Read(probeID[:]); rerr != nil {
+		return fmt.Errorf("internal: cannot generate probe session id: %w", rerr)
+	}
+	probeFrame := &frame.Frame{
+		SessionID: probeID,
+		Flags:     frame.FlagACK,
+	}
+	body, err := frame.EncodeBatch(c.aead, []*frame.Frame{probeFrame})
 	if err != nil {
 		return fmt.Errorf("internal: cannot encode probe batch: %w", err)
 	}

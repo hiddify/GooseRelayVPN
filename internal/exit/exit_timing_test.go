@@ -171,7 +171,7 @@ func TestDrainAll_RespectsBatchFrameCap(t *testing.T) {
 			s.sessions[id] = sess
 			s.txReady[id] = struct{}{}
 		}
-		frames := s.drainAll()
+		frames, _ := s.drainAll()
 		expected := total
 		if expected > maxDrainFramesPerBatch {
 			expected = maxDrainFramesPerBatch
@@ -194,7 +194,7 @@ func TestDrainAll_RespectsBatchFrameCap(t *testing.T) {
 			s.sessions[id] = sess
 			s.txReady[id] = struct{}{}
 		}
-		frames := s.drainAll()
+		frames, _ := s.drainAll()
 		if len(frames) != maxDrainFramesPerBatchBusy {
 			t.Fatalf("expected busy cap %d frames, got %d", maxDrainFramesPerBatchBusy, len(frames))
 		}

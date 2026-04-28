@@ -85,10 +85,12 @@ type Server struct {
 	cfg  Config
 	aead *frame.Crypto
 	dial func(network, address string, timeout time.Duration) (net.Conn, error)
+	dns  *dnsCache
 
 	mu          sync.Mutex
 	sessions    map[[frame.SessionIDLen]byte]*session.Session
 	txReady     map[[frame.SessionIDLen]byte]struct{} // sessions with pending TX frames
+	firstReply  map[[frame.SessionIDLen]byte]struct{} // sessions whose first downstream batch hasn't been sent yet
 	dialFail    map[string]time.Time
 	pendingRSTs []*frame.Frame // RST frames to send back on the next response
 
@@ -118,13 +120,15 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:      cfg,
-		aead:     aead,
-		dial:     net.DialTimeout,
-		sessions: make(map[[frame.SessionIDLen]byte]*session.Session),
-		txReady:  make(map[[frame.SessionIDLen]byte]struct{}),
-		dialFail: make(map[string]time.Time),
-		activity: make(chan struct{}, 1),
+		cfg:        cfg,
+		aead:       aead,
+		dial:       net.DialTimeout,
+		dns:        newDNSCache(),
+		sessions:   make(map[[frame.SessionIDLen]byte]*session.Session),
+		txReady:    make(map[[frame.SessionIDLen]byte]struct{}),
+		firstReply: make(map[[frame.SessionIDLen]byte]struct{}),
+		dialFail:   make(map[string]time.Time),
+		activity:   make(chan struct{}, 1),
 	}, nil
 }
 
@@ -196,13 +200,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	// while empty polls keep long-poll behavior for push responsiveness.
 	deadline := time.Now().Add(s.drainWindow(rxFrames))
 	for {
-		txFrames := s.drainAll()
+		txFrames, urgent := s.drainAll()
 		if len(txFrames) > 0 {
 			// Coalesce bursts into one response to reduce per-request overhead,
 			// but only when the batch is large enough to be bulk/video traffic.
 			// Small batches (≤ coalesceMinFrames) are interactive; adding a
 			// 25ms wait there compounds latency across every TLS round-trip.
-			if len(txFrames) > coalesceMinFrames {
+			// Urgent batches (RSTs, first downstream after SYN) skip coalesce
+			// unconditionally so connection setup is not delayed.
+			if !urgent && len(txFrames) > coalesceMinFrames {
 				coalesceDeadline := time.Now().Add(coalesceWindow)
 			coalesceLoop:
 				for {
@@ -214,7 +220,8 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 					case <-r.Context().Done():
 						return
 					case <-s.activity:
-						txFrames = append(txFrames, s.drainAll()...)
+						more, _ := s.drainAll()
+						txFrames = append(txFrames, more...)
 					case <-time.After(remainingCoalesce):
 						break coalesceLoop
 					}
@@ -310,9 +317,16 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 // openSession dials the upstream target, creates a Session for the given ID,
 // registers it, and spawns the bidirectional pump goroutines.
 func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*session.Session, error) {
-	upstream, err := s.dial("tcp", target, 15*time.Second)
+	upstream, err := dialWithDNSCache(s.dns, s.dial, "tcp", target, 15*time.Second)
 	if err != nil {
 		return nil, err
+	}
+	// Disable Nagle's algorithm so small writes (TLS handshake records, HTTP
+	// request lines) hit the wire immediately instead of waiting up to 40 ms
+	// to coalesce. Interactive workloads dominate this tunnel; throughput-bound
+	// flows already buffer at the kernel level.
+	if tcpConn, ok := upstream.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
 	}
 	sess := session.New(id, target, false)
 	sess.OnTx = func() {
@@ -324,6 +338,7 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 
 	s.mu.Lock()
 	s.sessions[id] = sess
+	s.firstReply[id] = struct{}{}
 	s.mu.Unlock()
 	s.stats.sessionsOpen.Add(1)
 
@@ -363,13 +378,20 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 	return sess, nil
 }
 
-func (s *Server) drainAll() []*frame.Frame {
+// drainAll returns all currently-buffered TX frames plus an `urgent` flag
+// signalling that at least one drained session is delivering its first
+// downstream batch (e.g. TLS server hello after SYN). The caller skips the
+// normal coalesce wait when urgent is set so connection setup isn't delayed
+// by 25 ms on every new TLS handshake.
+func (s *Server) drainAll() ([]*frame.Frame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*frame.Frame
+	var urgent bool
 	if len(s.pendingRSTs) > 0 {
 		out = append(out, s.pendingRSTs...)
 		s.pendingRSTs = s.pendingRSTs[:0]
+		urgent = true // RSTs are always urgent — client should know immediately
 	}
 	batchCap := maxDrainFramesPerBatch
 	if len(s.sessions) >= busySessionThreshold {
@@ -391,10 +413,16 @@ func (s *Server) drainAll() []*frame.Frame {
 		}
 		frames := sess.DrainTxLimited(MaxFramePayload, perSessionCap)
 		delete(s.txReady, id) // OnTx re-adds if more data arrives
+		if len(frames) > 0 {
+			if _, isFirst := s.firstReply[id]; isFirst {
+				urgent = true
+				delete(s.firstReply, id)
+			}
+		}
 		out = append(out, frames...)
 		remaining -= len(frames)
 	}
-	return out
+	return out, urgent
 }
 
 func (s *Server) gcDoneSessions() {
@@ -405,6 +433,7 @@ func (s *Server) gcDoneSessions() {
 			sess.Stop()
 			delete(s.sessions, id)
 			delete(s.txReady, id)
+			delete(s.firstReply, id)
 			s.stats.sessionsClose.Add(1)
 		}
 	}
