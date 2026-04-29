@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/kianmhz/GooseRelayVPN/internal/frame"
+	"github.com/kianmhz/GooseRelayVPN/pkg/frame"
 )
 
 // Diagnose performs a one-shot end-to-end health check against the first
