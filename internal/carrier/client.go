@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kianmhz/GooseRelayVPN/pkg/frame"
-	"github.com/kianmhz/GooseRelayVPN/pkg/session"
+	"github.com/kianmhz/GooseRelayVPN/internal/frame"
+	"github.com/kianmhz/GooseRelayVPN/internal/session"
 )
 
 const (

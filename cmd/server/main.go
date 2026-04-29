@@ -8,7 +8,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/kianmhz/GooseRelayVPN/pkg/config"
+	"github.com/kianmhz/GooseRelayVPN/internal/config"
 	"github.com/kianmhz/GooseRelayVPN/internal/exit"
 )
 

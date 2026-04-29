@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kianmhz/GooseRelayVPN/pkg/carrier"
-	"github.com/kianmhz/GooseRelayVPN/pkg/config"
-	"github.com/kianmhz/GooseRelayVPN/pkg/session"
-	"github.com/kianmhz/GooseRelayVPN/pkg/socks"
+	"github.com/kianmhz/GooseRelayVPN/internal/carrier"
+	"github.com/kianmhz/GooseRelayVPN/internal/config"
+	"github.com/kianmhz/GooseRelayVPN/internal/session"
+	"github.com/kianmhz/GooseRelayVPN/internal/socks"
 )
 
 type clientLogWriter struct {
